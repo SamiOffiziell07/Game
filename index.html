@@ -1,0 +1,1138 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+	<script>(function () {
+var parent = window.parent;
+if (!parent || parent === window) return;
+function send(action, content) {
+try {
+parent.postMessage({ action: action, content: content }, '*');
+} catch (e) {}
+}
+send('pageStarted');
+var contentShown = false;
+var contentSent = false;
+var contentVia = null;
+var parsed = false;
+var loaded = false;
+function usesSdk() {
+return !!document.querySelector('script[src*="/sdk/v1/rosebud.js"]');
+}
+function sendContent() {
+if (contentShown && parsed && !contentSent && (loaded || !usesSdk())) {
+contentSent = true;
+send('firstContent', { via: contentVia });
+}
+}
+function markContent(via) {
+if (contentShown) return;
+contentShown = true;
+contentVia = via;
+sendContent();
+}
+function markInnerFrame() {
+try {
+var frames = document.getElementsByTagName('iframe');
+var pageArea = window.innerWidth * window.innerHeight;
+for (var i = 0; i < frames.length; i++) {
+var box = frames[i].getBoundingClientRect();
+if (pageArea > 0 && box.width * box.height >= pageArea * 0.3) {
+markContent('frame');
+return;
+}
+}
+} catch (e) {}
+}
+document.addEventListener('DOMContentLoaded', function () {
+parsed = true;
+markInnerFrame();
+sendContent();
+});
+var paintTiming = false;
+try {
+paintTiming = PerformanceObserver.supportedEntryTypes.indexOf('paint') >= 0;
+if (paintTiming) {
+new PerformanceObserver(function (list) {
+var entries = list.getEntries();
+for (var i = 0; i < entries.length; i++) {
+if (entries[i].name === 'first-contentful-paint') markContent('paint');
+}
+}).observe({ type: 'paint', buffered: true });
+}
+} catch (e) {
+paintTiming = false;
+}
+var wrapped = [];
+function restoreDraws() {
+for (var i = 0; i < wrapped.length; i++) wrapped[i][0][wrapped[i][1]] = wrapped[i][2];
+wrapped = [];
+}
+var canvasDraws = [
+[window.WebGLRenderingContext, ['drawArrays', 'drawElements']],
+[window.WebGL2RenderingContext, ['drawArrays', 'drawElements', 'drawArraysInstanced', 'drawElementsInstanced', 'drawRangeElements']],
+[window.CanvasRenderingContext2D, ['drawImage', 'fillText', 'strokeText', 'putImageData', 'stroke']]
+];
+for (var c = 0; c < canvasDraws.length; c++) {
+if (!canvasDraws[c][0] || !canvasDraws[c][0].prototype) continue;
+for (var d = 0; d < canvasDraws[c][1].length; d++) {
+(function (proto, name) {
+var original = proto[name];
+if (typeof original !== 'function') return;
+wrapped.push([proto, name, original]);
+proto[name] = function () {
+try {
+if (this.canvas && this.canvas.isConnected && this.canvas.getClientRects().length > 0) {
+restoreDraws();
+markContent('canvas');
+}
+} catch (e) {}
+return original.apply(this, arguments);
+};
+})(canvasDraws[c][0].prototype, canvasDraws[c][1][d]);
+}
+}
+window.addEventListener(
+'load',
+function () {
+loaded = true;
+send('runtimeLoaded');
+if (!paintTiming) markContent('load');
+sendContent();
+},
+{ once: true }
+);
+var master = 1;
+var gains = [];
+var playing = [];
+var media = null;
+var gameVolumes = null;
+var applied = null;
+var routed = null;
+var getVolume = null;
+var setVolume = null;
+var volumeLocked = false;
+var gameMuted = null;
+var appliedMuted = null;
+var getMuted = null;
+var setMuted = null;
+var spare = null;
+var own = null;
+function setGain(gain, value) {
+try {
+gain.gain.value = value === undefined ? master : value;
+} catch (e) {}
+}
+function liveGains() {
+var live = [];
+for (var i = 0; i < gains.length; i++) {
+if (gains[i].context.state !== 'closed') live.push(gains[i]);
+}
+gains = live;
+return live;
+}
+function addMasterGain(context) {
+var output = context.destination;
+var gain = context.createGain();
+setGain(gain);
+gain.connect(output);
+var forwarded = ['maxChannelCount', 'channelCount', 'channelCountMode', 'channelInterpretation'];
+for (var i = 0; i < forwarded.length; i++) {
+(function (name) {
+Object.defineProperty(gain, name, {
+configurable: true,
+get: function () {
+return output[name];
+},
+set: function (value) {
+output[name] = value;
+}
+});
+})(forwarded[i]);
+}
+gain.disconnect = function () {};
+Object.defineProperty(context, 'destination', {
+configurable: true,
+get: function () {
+return gain;
+}
+});
+liveGains().push(gain);
+}
+function isRouted(element) {
+return !!routed && routed.has(element);
+}
+function gameVolume(element) {
+var volume = gameVolumes.get(element);
+if (volume === undefined) {
+volume = getVolume.call(element);
+gameVolumes.set(element, volume);
+}
+return volume;
+}
+function playedScale(element) {
+return isRouted(element) ? 1 : master;
+}
+function isGameMuted(element) {
+var muted = gameMuted.get(element);
+if (muted === undefined) {
+muted = getMuted.call(element);
+gameMuted.set(element, muted);
+}
+return muted;
+}
+function applyVolume(element) {
+if (volumeLocked) {
+var path = own && own.routes.get(element);
+if (path) setGain(path.gain, gameVolume(element));
+var waiting = !!own && own.waiting.has(element);
+setMuted.call(element, isGameMuted(element) || playedScale(element) === 0 || waiting);
+appliedMuted.set(element, getMuted.call(element));
+} else {
+setVolume.call(element, gameVolume(element) * playedScale(element));
+applied.set(element, getVolume.call(element));
+}
+listen(element);
+}
+function checkedVolume(value) {
+if (!spare) spare = document.createElement('audio');
+setVolume.call(spare, value);
+return getVolume.call(spare);
+}
+function markRouted(element) {
+try {
+routed.set(element, true);
+if (media) applyVolume(element);
+} catch (e) {}
+}
+function controlsChangedVolume(element) {
+if (volumeLocked) return controlsChangedMuted(element);
+var played = getVolume.call(element);
+var last = applied.get(element);
+if (last === undefined) {
+if (gameVolumes.has(element)) gameVolumes.set(element, played);
+return;
+}
+if (Math.abs(played - last) < 1e-6) return;
+var scale = playedScale(element);
+gameVolumes.set(element, scale > 0 ? Math.min(1, played / scale) : played);
+applyVolume(element);
+}
+function controlsChangedMuted(element) {
+var muted = getMuted.call(element);
+var last = appliedMuted.get(element);
+if (last === undefined) {
+if (gameMuted.has(element)) gameMuted.set(element, muted);
+return;
+}
+if (muted === last) return;
+gameMuted.set(element, muted);
+applyVolume(element);
+}
+function onPlay(event) {
+try {
+if (event.target instanceof window.HTMLMediaElement) track(event.target);
+} catch (e) {}
+}
+function onVolumeChange(event) {
+try {
+if (event.target instanceof window.HTMLMediaElement) controlsChangedVolume(event.target);
+} catch (e) {}
+}
+function listen(target) {
+if (!target || typeof target.addEventListener !== 'function') return;
+target.addEventListener('play', onPlay, true);
+target.addEventListener('volumechange', onVolumeChange, true);
+if (own) target.addEventListener('loadstart', onLoadStart, true);
+}
+function track(element) {
+applyVolume(element);
+var still = [element];
+for (var i = 0; i < playing.length; i++) {
+if (playing[i] !== element && !playing[i].paused) still.push(playing[i]);
+}
+playing = still;
+if (!own) return;
+if (own.routes.has(element)) {
+wakeOwnContext(false);
+plug(element);
+} else if (canRoute(element)) {
+wakeOwnContext(true);
+if (wantsRoute(element)) routeSoon(element);
+}
+}
+function prepareSource(element, url) {
+if (!(element instanceof window.HTMLAudioElement)) return;
+own.readable.delete(element);
+var target = new window.URL(String(url), document.baseURI);
+var local = target.origin === window.location.origin;
+if (element.crossOrigin === null || own.cors.has(element)) {
+own.setCrossOrigin.call(element, local ? 'anonymous' : null);
+if (local) own.cors.set(element, true);
+else own.cors.delete(element);
+}
+var inline = target.protocol === 'data:' || target.protocol === 'blob:';
+own.readable.set(element, inline || element.crossOrigin !== null);
+}
+function onLoadStart(event) {
+try {
+var element = event.target;
+var url = element instanceof window.HTMLAudioElement && element.currentSrc;
+if (!url) return;
+var protocol = new window.URL(url).protocol;
+own.readable.set(element, protocol === 'data:' || protocol === 'blob:' || element.crossOrigin !== null);
+if (!element.paused && wantsRoute(element)) routeSoon(element);
+} catch (e) {}
+}
+function canRoute(element) {
+return (
+element instanceof window.HTMLAudioElement &&
+!isRouted(element) &&
+!own.tried.has(element) &&
+own.readable.get(element) === true
+);
+}
+function wantsRoute(element) {
+return master < 1 && canRoute(element);
+}
+function wakeOwnContext(create) {
+try {
+if (!own.context) {
+if (!create) return;
+own.context = new own.Context();
+own.context.addEventListener('statechange', routeWaiting);
+}
+if (own.context.state === 'running') return;
+var resumed = own.context.resume();
+if (resumed && typeof resumed.then === 'function') resumed.then(routeWaiting, function () {});
+} catch (e) {}
+}
+function onTap() {
+wakeOwnContext(false);
+}
+function routeWaiting() {
+for (var i = 0; i < playing.length; i++) {
+if (!playing[i].paused && wantsRoute(playing[i])) routeSoon(playing[i]);
+}
+}
+function routeSoon(element) {
+if (!own.context || own.context.state !== 'running' || own.waiting.has(element)) return;
+own.waiting.set(element, true);
+applyVolume(element);
+if (!element.paused && element.readyState >= 3) {
+routeLater(element);
+} else {
+element.addEventListener('playing', onPlaying);
+}
+}
+function onPlaying(event) {
+var element = event.target;
+try {
+element.removeEventListener('playing', onPlaying);
+} catch (e) {}
+routeLater(element);
+}
+function routeLater(element) {
+setTimeout(function () {
+try {
+route(element);
+} catch (e) {}
+}, 0);
+}
+function route(element) {
+own.waiting.delete(element);
+var source = null;
+try {
+if (own.context && own.context.state === 'running' && !element.paused && wantsRoute(element)) {
+own.tried.set(element, true);
+source = own.context.createMediaElementSource(element);
+}
+} catch (e) {}
+if (!source) return applyVolume(element);
+try {
+var gain = own.context.createGain();
+setGain(gain, gameVolume(element));
+own.routes.set(element, { source: source, gain: gain, plugged: false });
+element.addEventListener('pause', unplug);
+element.addEventListener('emptied', unplug);
+plug(element);
+} catch (e) {}
+}
+function plug(element) {
+var path = own.routes.get(element);
+if (!path || path.plugged) return;
+path.source.connect(path.gain);
+path.gain.connect(own.context.destination);
+path.plugged = true;
+}
+function unplug(event) {
+try {
+var element = event.target;
+var path = own.routes.get(element);
+if (!path || !path.plugged || !element.paused) return;
+path.source.disconnect();
+path.gain.disconnect();
+path.plugged = false;
+} catch (e) {}
+}
+function watchSources() {
+var setAttribute = media.setAttribute;
+if (typeof setAttribute === 'function') {
+media.setAttribute = function (name) {
+try {
+var key = String(name).toLowerCase();
+if (key === 'src') {
+prepareSource(this, arguments[1]);
+listen(this);
+} else if (key === 'crossorigin') own.cors.delete(this);
+} catch (e) {}
+return setAttribute.apply(this, arguments);
+};
+}
+var cloneNode = media.cloneNode;
+if (typeof cloneNode === 'function') {
+media.cloneNode = function () {
+var copy = cloneNode.apply(this, arguments);
+try {
+if (own.cors.has(this)) own.cors.set(copy, true);
+if (own.readable.has(this)) own.readable.set(copy, own.readable.get(this));
+listen(copy);
+} catch (e) {}
+return copy;
+};
+}
+var crossOrigin = Object.getOwnPropertyDescriptor(media, 'crossOrigin');
+Object.defineProperty(media, 'crossOrigin', {
+configurable: true,
+enumerable: crossOrigin.enumerable,
+get: crossOrigin.get,
+set: function (value) {
+try {
+own.cors.delete(this);
+} catch (e) {}
+crossOrigin.set.call(this, value);
+}
+});
+}
+function wrapAudio() {
+var Native = window.Audio;
+if (typeof Native !== 'function' || !Native.prototype) return;
+function RosebudAudio(src) {
+if (!(this instanceof RosebudAudio)) return Native.apply(this, arguments);
+var element =
+typeof Reflect === 'object' && Reflect.construct
+? Reflect.construct(Native, [], this.constructor)
+: new Native();
+if (src !== undefined) element.src = src;
+return element;
+}
+RosebudAudio.prototype = Native.prototype;
+try {
+if (Object.setPrototypeOf) Object.setPrototypeOf(RosebudAudio, Native);
+} catch (e) {}
+window.Audio = RosebudAudio;
+}
+var contextWrappers = [];
+function wrapAudioContext(name) {
+var Native = window[name];
+if (typeof Native !== 'function' || !Native.prototype) return;
+for (var i = 0; i < contextWrappers.length; i++) {
+if (contextWrappers[i][0] === Native) {
+window[name] = contextWrappers[i][1];
+return;
+}
+}
+function RosebudAudioContext() {
+if (!(this instanceof RosebudAudioContext)) return Native.apply(this, arguments);
+var context =
+typeof Reflect === 'object' && Reflect.construct
+? Reflect.construct(Native, arguments, this.constructor)
+: arguments.length
+? new Native(arguments[0])
+: new Native();
+try {
+addMasterGain(context);
+} catch (e) {}
+return context;
+}
+RosebudAudioContext.prototype = Native.prototype;
+try {
+if (Object.setPrototypeOf) Object.setPrototypeOf(RosebudAudioContext, Native);
+} catch (e) {}
+var createSource = Native.prototype.createMediaElementSource;
+if (typeof createSource === 'function' && routed) {
+Native.prototype.createMediaElementSource = function (element) {
+var node = createSource.apply(this, arguments);
+markRouted(element);
+return node;
+};
+}
+contextWrappers.push([Native, RosebudAudioContext]);
+window[name] = RosebudAudioContext;
+}
+function wrapMediaSourceNode() {
+var Native = window.MediaElementAudioSourceNode;
+if (typeof Native !== 'function' || !Native.prototype || !routed) return;
+function RosebudMediaElementAudioSourceNode(context, options) {
+if (!(this instanceof RosebudMediaElementAudioSourceNode)) return Native.apply(this, arguments);
+var node =
+typeof Reflect === 'object' && Reflect.construct
+? Reflect.construct(Native, arguments, this.constructor)
+: new Native(context, options);
+if (options) markRouted(options.mediaElement);
+return node;
+}
+RosebudMediaElementAudioSourceNode.prototype = Native.prototype;
+try {
+if (Object.setPrototypeOf) Object.setPrototypeOf(RosebudMediaElementAudioSourceNode, Native);
+} catch (e) {}
+window.MediaElementAudioSourceNode = RosebudMediaElementAudioSourceNode;
+}
+function applyMaster() {
+var live = liveGains();
+for (var i = 0; i < live.length; i++) setGain(live[i]);
+var still = [];
+for (var j = 0; j < playing.length; j++) {
+if (playing[j].paused) continue;
+still.push(playing[j]);
+try {
+applyVolume(playing[j]);
+} catch (e) {}
+}
+playing = still;
+if (own) routeWaiting();
+}
+try {
+if (typeof WeakMap === 'function') {
+gameVolumes = new WeakMap();
+applied = new WeakMap();
+routed = new WeakMap();
+gameMuted = new WeakMap();
+appliedMuted = new WeakMap();
+}
+wrapAudioContext('AudioContext');
+wrapAudioContext('webkitAudioContext');
+wrapMediaSourceNode();
+var mediaProto = window.HTMLMediaElement && window.HTMLMediaElement.prototype;
+var volumeDescriptor = mediaProto && Object.getOwnPropertyDescriptor(mediaProto, 'volume');
+if (gameVolumes && volumeDescriptor && volumeDescriptor.get && volumeDescriptor.set && volumeDescriptor.configurable) {
+media = mediaProto;
+getVolume = volumeDescriptor.get;
+setVolume = volumeDescriptor.set;
+var userAgent = (window.navigator && window.navigator.userAgent) || '';
+var mutedDescriptor = Object.getOwnPropertyDescriptor(media, 'muted');
+if (
+/\b(iPhone|iPod)\b/.test(userAgent) &&
+mutedDescriptor &&
+mutedDescriptor.get &&
+mutedDescriptor.set &&
+mutedDescriptor.configurable
+) {
+volumeLocked = true;
+getMuted = mutedDescriptor.get;
+setMuted = mutedDescriptor.set;
+Object.defineProperty(media, 'muted', {
+configurable: true,
+enumerable: mutedDescriptor.enumerable,
+get: function () {
+return isGameMuted(this);
+},
+set: function (value) {
+try {
+gameMuted.set(this, !!value);
+applyVolume(this);
+} catch (e) {
+setMuted.call(this, value);
+}
+}
+});
+var Context = window.AudioContext || window.webkitAudioContext;
+var crossOriginDescriptor = Object.getOwnPropertyDescriptor(media, 'crossOrigin');
+if (
+Context &&
+window.HTMLAudioElement &&
+window.URL &&
+window.location &&
+crossOriginDescriptor &&
+crossOriginDescriptor.set &&
+crossOriginDescriptor.configurable
+) {
+own = {
+Context: Context,
+context: null,
+setCrossOrigin: crossOriginDescriptor.set,
+cors: new WeakMap(),
+readable: new WeakMap(),
+waiting: new WeakMap(),
+tried: new WeakMap(),
+routes: new WeakMap()
+};
+watchSources();
+wrapAudio();
+var taps = ['touchend', 'click', 'keydown'];
+for (var t = 0; t < taps.length; t++) window.addEventListener(taps[t], onTap, true);
+}
+}
+Object.defineProperty(media, 'volume', {
+configurable: true,
+enumerable: volumeDescriptor.enumerable,
+get: function () {
+return gameVolume(this);
+},
+set: function (value) {
+var volume;
+try {
+volume = checkedVolume(value);
+} catch (error) {
+if (spare) throw error;
+setVolume.call(this, value);
+volume = getVolume.call(this);
+}
+try {
+gameVolumes.set(this, volume);
+applyVolume(this);
+} catch (e) {}
+}
+});
+var play = media.play;
+if (typeof play === 'function') {
+media.play = function () {
+try {
+track(this);
+} catch (e) {}
+return play.apply(this, arguments);
+};
+}
+listen(document);
+var sources = ['src', 'srcObject', 'autoplay'];
+for (var i = 0; i < sources.length; i++) {
+(function (name) {
+var descriptor = Object.getOwnPropertyDescriptor(media, name);
+if (!descriptor || !descriptor.set || !descriptor.configurable) return;
+Object.defineProperty(media, name, {
+configurable: true,
+enumerable: descriptor.enumerable,
+get: descriptor.get,
+set: function (value) {
+if (own) {
+try {
+if (name === 'src') prepareSource(this, value);
+if (name === 'srcObject') own.readable.delete(this);
+} catch (e) {}
+}
+descriptor.set.call(this, value);
+try {
+listen(this);
+} catch (e) {}
+}
+});
+})(sources[i]);
+}
+var elementProto = window.Element && window.Element.prototype;
+var attachShadow = elementProto && elementProto.attachShadow;
+if (typeof attachShadow === 'function') {
+elementProto.attachShadow = function () {
+var root = attachShadow.apply(this, arguments);
+try {
+listen(root);
+} catch (e) {}
+return root;
+};
+}
+}
+window.addEventListener('message', function (event) {
+try {
+var data = event.data;
+if (event.source !== parent || !data || data.action !== 'setVolume' || !data.content) return;
+var volume = data.content.volume;
+if (typeof volume !== 'number' || volume !== volume) return;
+master = Math.min(1, Math.max(0, volume));
+applyMaster();
+} catch (e) {}
+});
+} catch (e) {}
+})();</script>
+	<script src="https://storage.googleapis.com/rosebud_staticfiles/ScriptsLoader-Universal.js?v=c26350c252c2"></script>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <title>Kicko! Pocket Soccer</title>
+  <link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@500;600;700&display=swap" rel="stylesheet">
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://esm.sh/three@0.160.0",
+      "three/": "https://esm.sh/three@0.160.0/"
+    }
+  }
+  </script>
+  <style>
+    :root {
+      --team1: #ff3b6b;
+      --team1-dark: #c41945;
+      --team2: #2ec3ff;
+      --team2-dark: #1773a8;
+      --accent: #ffd23f;
+      --pitch: #4cc26a;
+      --ink: #1b1d2a;
+    }
+    * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    html, body {
+      margin: 0; padding: 0; overflow: hidden;
+      background: #0b1020;
+      font-family: 'Fredoka', system-ui, sans-serif;
+      color: white;
+      user-select: none; -webkit-user-select: none;
+      touch-action: none;
+      width: 100%; height: 100%;
+      position: fixed;
+    }
+    canvas { display: block; }
+    #renderDiv { width: 100vw; height: 100vh; position: absolute; inset: 0; }
+
+    /* ===== HUD ===== */
+    #hud {
+      position: absolute; top: 0; left: 0; right: 0;
+      padding: env(safe-area-inset-top, 14px) 14px 0;
+      display: flex; justify-content: center;
+      pointer-events: none; z-index: 10;
+    }
+    .scoreboard {
+      margin-top: 12px;
+      display: flex; align-items: center; gap: 10px;
+      background: linear-gradient(180deg, #21263b 0%, #14172a 100%);
+      border: 3px solid #0a0c18;
+      border-radius: 22px;
+      padding: 8px 14px;
+      box-shadow: 0 6px 0 #0a0c18, 0 12px 24px rgba(0,0,0,0.4);
+      font-weight: 700;
+    }
+    .team-badge {
+      width: 38px; height: 38px; border-radius: 12px;
+      display: grid; place-items: center;
+      font-size: 22px; font-weight: 700;
+      color: white;
+      box-shadow: inset 0 -4px 0 rgba(0,0,0,0.25);
+      border: 2px solid rgba(0,0,0,0.3);
+    }
+    .team-badge.t1 { background: var(--team1); }
+    .team-badge.t2 { background: var(--team2); }
+    .score-num {
+      font-size: 30px; min-width: 28px; text-align: center;
+      text-shadow: 0 2px 0 rgba(0,0,0,0.5);
+    }
+    .timer {
+      background: var(--ink);
+      border-radius: 14px;
+      padding: 4px 12px;
+      font-size: 18px;
+      letter-spacing: 1px;
+      color: var(--accent);
+      border: 2px solid rgba(255,255,255,0.1);
+    }
+
+    /* ===== Controls ===== */
+    #controls {
+      position: absolute; left: 0; right: 0; bottom: 0;
+      padding: 0 22px env(safe-area-inset-bottom, 22px);
+      padding-bottom: max(22px, env(safe-area-inset-bottom, 22px));
+      height: 220px;
+      display: flex; justify-content: space-between; align-items: flex-end;
+      pointer-events: none; z-index: 10;
+    }
+    #joystick {
+      position: relative;
+      width: 150px; height: 150px;
+      border-radius: 50%;
+      background: radial-gradient(circle at 30% 30%, rgba(255,255,255,0.18), rgba(255,255,255,0.06));
+      border: 3px solid rgba(255,255,255,0.25);
+      box-shadow: inset 0 0 20px rgba(0,0,0,0.3), 0 6px 0 rgba(0,0,0,0.25);
+      pointer-events: auto;
+      touch-action: none;
+    }
+    #joystick::before {
+      content: ''; position: absolute; inset: 18px;
+      border-radius: 50%;
+      border: 2px dashed rgba(255,255,255,0.18);
+    }
+    #stick {
+      position: absolute; left: 50%; top: 50%;
+      width: 64px; height: 64px;
+      border-radius: 50%;
+      background: radial-gradient(circle at 30% 30%, #fff, #d0d6e8 60%, #8d95b3);
+      border: 3px solid #1b1d2a;
+      box-shadow: 0 4px 0 rgba(0,0,0,0.35);
+      transform: translate(-50%, -50%);
+      transition: transform 0.04s linear;
+    }
+    .btn-stack {
+      display: flex; flex-direction: column; gap: 14px;
+      align-items: center;
+      pointer-events: auto;
+    }
+    .action-btn {
+      position: relative;
+      width: 86px; height: 86px;
+      border-radius: 50%;
+      border: 4px solid #0a0c18;
+      font-family: inherit; font-weight: 700;
+      font-size: 20px; color: white;
+      box-shadow: 0 6px 0 #0a0c18, 0 10px 18px rgba(0,0,0,0.4);
+      display: grid; place-items: center;
+      cursor: pointer;
+      transition: transform 0.08s, box-shadow 0.08s;
+      pointer-events: auto;
+      touch-action: none;
+      letter-spacing: 0.5px;
+    }
+    /* Tiny key-cap shown above each action button — desktop only */
+    .action-btn .keycap {
+      position: absolute;
+      top: -14px; left: 50%; transform: translateX(-50%);
+      background: #fff; color: #1b1d2a;
+      border: 2px solid #0a0c18;
+      border-radius: 8px;
+      padding: 2px 8px;
+      font-size: 11px; font-weight: 700;
+      letter-spacing: 1px;
+      box-shadow: 0 2px 0 #0a0c18;
+      white-space: nowrap;
+      pointer-events: none;
+      display: none;
+    }
+    /* Reveal only on confirmed desktop (fine pointer + hover capability) */
+    @media (hover: hover) and (pointer: fine) {
+      .action-btn .keycap { display: block; }
+    }
+    .action-btn:active, .action-btn.pressed {
+      transform: translateY(4px);
+      box-shadow: 0 2px 0 #0a0c18, 0 4px 8px rgba(0,0,0,0.4);
+    }
+    #btn-shoot {
+      background: linear-gradient(180deg, #ff8b3d, #ff3b6b);
+      width: 96px; height: 96px;
+      font-size: 22px;
+    }
+    #btn-pass {
+      background: linear-gradient(180deg, #5fe0a8, #2ec3ff);
+    }
+
+    /* ===== Overlay screens ===== */
+    .overlay {
+      position: absolute; inset: 0;
+      background: radial-gradient(ellipse at center, rgba(11,16,32,0.5), rgba(11,16,32,0.92));
+      display: grid; place-items: center;
+      z-index: 50;
+      animation: fadeIn 0.3s ease;
+    }
+    @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+    .panel {
+      background: linear-gradient(180deg, #2a2f4a, #161a2d);
+      border: 4px solid #0a0c18;
+      border-radius: 28px;
+      padding: 32px 28px;
+      text-align: center;
+      box-shadow: 0 10px 0 #0a0c18, 0 20px 40px rgba(0,0,0,0.5);
+      max-width: 88vw;
+      min-width: 280px;
+    }
+    .panel h1 {
+      margin: 0 0 6px; font-size: 44px;
+      background: linear-gradient(180deg, #ffd23f, #ff8b3d);
+      -webkit-background-clip: text; background-clip: text;
+      color: transparent;
+      text-shadow: 0 4px 0 rgba(0,0,0,0.3);
+      letter-spacing: 1px;
+      filter: drop-shadow(0 4px 0 rgba(0,0,0,0.5));
+    }
+    .panel .sub {
+      font-size: 16px; color: #b8bfd8; margin-bottom: 22px;
+      letter-spacing: 0.5px;
+    }
+    .big-btn {
+      background: linear-gradient(180deg, #ffd23f, #ff8b3d);
+      color: #1b1d2a;
+      border: 4px solid #0a0c18;
+      border-radius: 20px;
+      padding: 14px 36px;
+      font-family: inherit; font-weight: 700; font-size: 22px;
+      cursor: pointer;
+      box-shadow: 0 6px 0 #0a0c18, 0 10px 20px rgba(0,0,0,0.4);
+      transition: transform 0.08s, box-shadow 0.08s;
+      letter-spacing: 1px;
+    }
+    .big-btn:active {
+      transform: translateY(4px);
+      box-shadow: 0 2px 0 #0a0c18;
+    }
+    .download-btn {
+      display: block;
+      width: 100%;
+      margin-top: 14px;
+      padding: 11px 16px;
+      background: linear-gradient(180deg, #5b6688, #343b58);
+      color: #fff;
+      font-size: 15px;
+      letter-spacing: 0.5px;
+    }
+    #download-status {
+      min-height: 18px;
+      margin-top: 8px;
+      color: #b8bfd8;
+      font-size: 12px;
+    }
+    .goal-banner {
+      font-size: 88px;
+      font-weight: 700;
+      background: linear-gradient(180deg, #ffd23f, #ff3b6b);
+      -webkit-background-clip: text; background-clip: text;
+      color: transparent;
+      filter: drop-shadow(0 6px 0 rgba(0,0,0,0.5));
+      letter-spacing: 4px;
+      animation: pop 0.6s cubic-bezier(.2,1.4,.4,1);
+    }
+    @keyframes pop {
+      0% { transform: scale(0.2) rotate(-15deg); opacity: 0; }
+      60% { transform: scale(1.2) rotate(5deg); }
+      100% { transform: scale(1) rotate(0); opacity: 1; }
+    }
+    .hidden { display: none !important; }
+
+    /* Set-piece banner (throw-in / goal kick) */
+    #setpiece-banner {
+      position: absolute; top: 32%; left: 0; right: 0;
+      display: grid; place-items: center;
+      pointer-events: none; z-index: 40;
+      animation: slideIn 0.4s cubic-bezier(.2,1.4,.4,1);
+    }
+    .setpiece-text {
+      background: linear-gradient(180deg, #ffd23f, #ff8b3d);
+      color: #1b1d2a;
+      padding: 12px 28px;
+      border: 4px solid #0a0c18;
+      border-radius: 18px;
+      font-size: 32px; font-weight: 700;
+      letter-spacing: 3px;
+      box-shadow: 0 6px 0 #0a0c18, 0 12px 24px rgba(0,0,0,0.5);
+      text-shadow: 0 2px 0 rgba(255,255,255,0.3);
+    }
+    @keyframes slideIn {
+      0% { transform: translateY(-30px); opacity: 0; }
+      100% { transform: translateY(0); opacity: 1; }
+    }
+
+    /* Modifier announcement (big, centered, brief) */
+    #modifier-banner {
+      position: absolute; top: 28%; left: 0; right: 0;
+      display: grid; place-items: center;
+      pointer-events: none; z-index: 41;
+      animation: modPop 0.5s cubic-bezier(.2,1.4,.4,1);
+      text-align: center;
+    }
+    .mod-emoji {
+      font-size: 72px; line-height: 1;
+      filter: drop-shadow(0 4px 8px rgba(0,0,0,0.5));
+      animation: spin 1.2s ease-in-out;
+    }
+    .mod-title {
+      margin-top: 8px;
+      font-size: 38px; font-weight: 700;
+      background: linear-gradient(180deg, #ffffff, #ffd23f);
+      -webkit-background-clip: text; background-clip: text;
+      color: transparent;
+      filter: drop-shadow(0 4px 0 rgba(0,0,0,0.6));
+      letter-spacing: 3px;
+    }
+    .mod-sub {
+      font-size: 16px; color: #ffffff;
+      text-shadow: 0 2px 0 rgba(0,0,0,0.5);
+      letter-spacing: 1px;
+      margin-top: 4px;
+    }
+    @keyframes modPop {
+      0% { transform: scale(0.3); opacity: 0; }
+      60% { transform: scale(1.15); }
+      100% { transform: scale(1); opacity: 1; }
+    }
+    @keyframes spin {
+      0% { transform: rotate(-20deg) scale(0.5); }
+      50% { transform: rotate(20deg) scale(1.2); }
+      100% { transform: rotate(0) scale(1); }
+    }
+
+    /* Active modifier chip near scoreboard */
+    #modifier-chip {
+      position: absolute;
+      top: calc(env(safe-area-inset-top, 14px) + 76px);
+      left: 50%; transform: translateX(-50%);
+      background: linear-gradient(180deg, #2a2f4a, #161a2d);
+      border: 3px solid #0a0c18;
+      border-radius: 16px;
+      padding: 6px 14px;
+      font-size: 14px; font-weight: 700;
+      letter-spacing: 1.5px;
+      color: #ffd23f;
+      box-shadow: 0 4px 0 #0a0c18, 0 8px 16px rgba(0,0,0,0.4);
+      display: flex; align-items: center; gap: 8px;
+      z-index: 11;
+      pointer-events: none;
+    }
+    #modifier-chip-emoji { font-size: 18px; }
+    #modifier-chip-time {
+      background: #0a0c18; color: white;
+      padding: 2px 8px; border-radius: 8px;
+      min-width: 22px; text-align: center;
+      font-size: 13px;
+    }
+
+    /* Title screen art */
+    .title-emoji {
+      font-size: 64px;
+      margin-bottom: 6px;
+      animation: bob 2s ease-in-out infinite;
+    }
+    @keyframes bob {
+      0%, 100% { transform: translateY(0) rotate(-5deg); }
+      50% { transform: translateY(-10px) rotate(5deg); }
+    }
+    .controls-hint {
+      font-size: 13px; color: #b8bfd8;
+      margin-top: 16px; line-height: 1.8;
+    }
+    .controls-hint .hint-row {
+      display: flex; align-items: center; justify-content: center;
+      gap: 4px; flex-wrap: wrap;
+      margin: 2px 0;
+    }
+    .controls-hint .kbd {
+      display: inline-grid; place-items: center;
+      min-width: 20px; height: 22px; padding: 0 6px;
+      background: linear-gradient(180deg, #fff, #d0d6e8);
+      color: #1b1d2a;
+      border: 2px solid #0a0c18;
+      border-radius: 6px;
+      font-size: 11px; font-weight: 700;
+      box-shadow: 0 2px 0 #0a0c18;
+      letter-spacing: 0.5px;
+      margin: 0 1px;
+    }
+    .controls-hint .kbd-wide { padding: 0 10px; }
+    .controls-hint .kbd-row { display: inline-flex; gap: 2px; }
+    /* Title-screen controls hint visibility:
+       By default hide BOTH variants, then reveal exactly one based on the device type.
+       This avoids any flash of the wrong hint on devices that match neither query cleanly. */
+    .controls-hint .hint-row { display: none; }
+    .controls-hint .mobile-hint { display: none; }
+    @media (hover: hover) and (pointer: fine) {
+      /* Desktop: show key-hint rows, keep mobile hint hidden. */
+      .controls-hint .hint-row:not(.mobile-hint) { display: flex; }
+    }
+    @media (hover: none), (pointer: coarse) {
+      /* Touch / mobile: show only the mobile hint row, no keyboard chips. */
+      .controls-hint .mobile-hint { display: flex; }
+      .controls-hint .hint-row:not(.mobile-hint) { display: none !important; }
+    }
+
+    /* Desktop: slightly dim the on-screen controls since keyboard is primary */
+    @media (hover: hover) and (pointer: fine) {
+      #controls { opacity: 0.85; }
+    }
+  </style>
+</head>
+<body>
+  <div id="renderDiv"></div>
+
+  <div id="hud">
+    <div class="scoreboard">
+      <div class="team-badge t1">P</div>
+      <div class="score-num" id="score1">0</div>
+      <div class="timer" id="timer">2:00</div>
+      <div class="score-num" id="score2">0</div>
+      <div class="team-badge t2">C</div>
+    </div>
+  </div>
+
+  <div id="controls">
+    <div id="joystick">
+      <div id="stick"></div>
+    </div>
+    <div class="btn-stack">
+      <button class="action-btn" id="btn-pass">
+        <span class="keycap">SHIFT</span>
+        PASS
+      </button>
+      <button class="action-btn" id="btn-shoot">
+        <span class="keycap">SPACE</span>
+        SHOOT
+      </button>
+    </div>
+  </div>
+
+  <!-- Title screen -->
+  <div class="overlay" id="title-screen">
+    <div class="panel">
+      <div class="title-emoji">⚽</div>
+      <h1>KICKO!</h1>
+      <div class="sub">POCKET SOCCER</div>
+      <button class="big-btn" id="play-btn">PLAY</button>
+      <button class="big-btn download-btn" id="download-btn" type="button">ZIP HERUNTERLADEN</button>
+      <div id="download-status" role="status" aria-live="polite"></div>
+      <div class="controls-hint">
+        <div class="hint-row">
+          <span class="kbd-row">
+            <span class="kbd">W</span><span class="kbd">A</span><span class="kbd">S</span><span class="kbd">D</span>
+          </span>
+          or <span class="kbd">↑</span><span class="kbd">←</span><span class="kbd">↓</span><span class="kbd">→</span>
+          &nbsp;Move
+        </div>
+        <div class="hint-row">
+          <span class="kbd kbd-wide">SPACE</span> Shoot &nbsp;·&nbsp;
+          <span class="kbd kbd-wide">SHIFT</span> Pass
+        </div>
+        <div class="hint-row" style="opacity:0.75">
+          Control auto-switches to whoever has the ball
+        </div>
+        <div class="hint-row mobile-hint">
+          Drag joystick · Tap buttons
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Goal banner -->
+  <div class="overlay hidden" id="goal-screen">
+    <div class="goal-banner" id="goal-text">GOAL!</div>
+  </div>
+
+  <!-- Set-piece banner (throw-in / goal kick) -->
+  <div id="setpiece-banner" class="hidden">
+    <div class="setpiece-text" id="setpiece-text">THROW IN</div>
+  </div>
+
+  <!-- Modifier announcement -->
+  <div id="modifier-banner" class="hidden">
+    <div class="mod-emoji" id="mod-emoji">⚡</div>
+    <div class="mod-title" id="mod-title">SPEED BOOST!</div>
+    <div class="mod-sub" id="mod-sub">Everyone is faster</div>
+  </div>
+
+  <!-- Active modifier chip in HUD -->
+  <div id="modifier-chip" class="hidden">
+    <span id="modifier-chip-emoji">⚡</span>
+    <span id="modifier-chip-text">SPEED</span>
+    <span id="modifier-chip-time">10</span>
+  </div>
+
+  <!-- End screen -->
+  <div class="overlay hidden" id="end-screen">
+    <div class="panel">
+      <h1 id="end-title">FULL TIME</h1>
+      <div class="sub" id="end-sub">Great match!</div>
+      <button class="big-btn" id="rematch-btn">REMATCH</button>
+    </div>
+  </div>
+
+  <script type="module" src="./main.js"></script>
+  <script type="module" src="./download.js"></script>
+</body>
+</html>
